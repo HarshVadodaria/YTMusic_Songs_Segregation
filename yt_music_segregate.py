@@ -1,7 +1,11 @@
 from ytmusicapi import YTMusic
 import threading
 import queue
+import os
+import time
+import pandas as pd
 from artist_origin_checker import classify_artist
+
 
 ytmusic_songs = []
 transformed_songs = {
@@ -11,17 +15,27 @@ transformed_songs = {
 }
 data_queue = queue.Queue()
 
+headers = ["artist_name", "is_indian"]
+
+pd.DataFrame(columns=headers).to_csv(
+    "artist_cache.csv",
+    index=False,
+    header=not os.path.exists("artist_cache.csv"),
+    mode="a",
+)
 
 def extract_songs(ytmusic):
     """Fetch liked songs from YouTube Music"""
     
     print("Fetching liked songs...\n")
     liked_songs = ytmusic.get_liked_songs(limit=1000)
-    print("Fetched!\n")    
+    print("Fetched!\n")
+    time.sleep(1)    
     return liked_songs
 
 
 def create_chunks(liked_songs):
+    """Create chunks of songs to process in batches"""
     for i in range(0, len(liked_songs['tracks']), 100):
         chunk = liked_songs['tracks'][i:i + 100]
         yield chunk
@@ -32,21 +46,34 @@ def trasform_songs(liked_songs):
     
     for songs in create_chunks(liked_songs):
         for song in songs:
-            print(song['artists'][0]['name'].split(', ')[0], "\n")
-            result = classify_artist(song['artists'][0]['name'].split(', ')[0])
-            
-            if result.get('is_indian') == True:
+            artist = song['artists'][0]['name'].split(', ')[0]
+
+            try:
+                cache_existing_data = pd.read_csv('artist_cache.csv')
+            except pd.errors.EmptyDataError as error:
+                cache_existing_data = pd.DataFrame(columns=["artist_name", "is_indian"])
+
+            print(artist, "\n")
+            result_df = cache_existing_data[cache_existing_data["artist_name"] == artist]
+
+            if result_df.empty:
+                result = classify_artist(artist).get('is_indian')
+                pd.DataFrame([{'artist_name': artist, 'is_indian': result}]).to_csv('artist_cache.csv', mode='a', header=False, index=False)
+            else:
+                result = result_df.iloc[0]['is_indian']
+
+
+            if result == True:
                 transformed_songs["hindi"].append(song.get('videoId'))
-            elif result.get('is_indian') == False:
+            elif result == False:
                 transformed_songs["non_hindi"].append(song.get('videoId'))
-            elif result.get('is_indian') == None:
+            elif pd.isna(result):
                 transformed_songs["unknown"].append(song.get('videoId'))
-        
-            data_queue.put(transformed_songs)
+            # data_queue.put(transformed_songs)
+
             total = len(transformed_songs["hindi"]) + len(transformed_songs["non_hindi"]) + len(transformed_songs["unknown"])
             print(len(transformed_songs["hindi"]), len(transformed_songs["non_hindi"]), len(transformed_songs["unknown"]), total, len(liked_songs['tracks']), "\n")
-
-
+    time.sleep(1)
 
 def create_playlist(ytmusic):
     """Create playlists for Hindi, Non-Hindi and Unknown songs"""
@@ -76,18 +103,24 @@ def create_playlist(ytmusic):
         print("Hindi, Non-Hindi and unknown songs playlist created\n")
 
     print(hindi_playlist, non_hindi_playlist, unknown_songs_playlist, "\n")
+    time.sleep(1)
 
     return hindi_playlist, non_hindi_playlist, unknown_songs_playlist
 
-def load_songs_to_playlist(playlist_id, video_ids, ytmusic, genre):
-    video_ids = data_queue.get()  # Wait for transformed songs to be available
-    video_ids_list = video_ids[genre]
-    CHUNK_SIZE = 100
 
-    for i in range(0, len(video_ids_list), CHUNK_SIZE):
-        print(f"adding {len(video_ids_list[i:i + CHUNK_SIZE])} songs to {genre} playlist...\n")
-        ytmusic.add_playlist_items(playlist_id, video_ids_list[i:i + CHUNK_SIZE])
-        # time.sleep(1)  # sleep to avoid rate limits
+def load_songs_to_playlist(playlist_id, video_ids, ytmusic, genre):
+    # video_ids = data_queue.get()  # Wait for transformed songs to be available
+    # video_ids_list = video_ids[genre]
+    video_ids_list = video_ids
+    CHUNK_SIZE = 10
+
+
+    if len(video_ids_list) > 0:
+        # ytmusic.add_playlist_items(playlist_id, video_ids_list)
+        for i in range(0, len(video_ids_list), CHUNK_SIZE):
+            print(f"adding {len(video_ids_list[i:i + CHUNK_SIZE])} songs to {genre} playlist {playlist_id}...\n")
+            res = ytmusic.add_playlist_items(playlist_id, video_ids_list[i:i + CHUNK_SIZE])
+            time.sleep(1)  # sleep to avoid rate limits
 
 
 def main():
@@ -102,28 +135,36 @@ def main():
 
     # segregate songs based on artist origin
     trasform_songs(ytmusic_songs)
-    
+
     # Create new playlists
     hindi_playlist, non_hindi_playlist, unknown_songs_playlist = create_playlist(ytmusic)
+    
+    load_songs_to_playlist(hindi_playlist['id'], transformed_songs["hindi"], ytmusic, "hindi")
+    load_songs_to_playlist(non_hindi_playlist['id'], transformed_songs["non_hindi"], ytmusic, "non_hindi")
+    load_songs_to_playlist(unknown_songs_playlist['id'], transformed_songs["unknown"], ytmusic, "unknown")
 
     # Load songs to respective playlists in parallel
-    transform_thread = threading.Thread(target=transformed_songs, args=(ytmusic_songs,))
-    load_hindi_thread = threading.Thread(target=load_songs_to_playlist, args=(hindi_playlist['id'], transformed_songs["hindi"], ytmusic, "Hindi"))
-    load_non_hindi_thread = threading.Thread(target=load_songs_to_playlist, args=(non_hindi_playlist['id'], transformed_songs["non_hindi"], ytmusic, "Non-Hindi"))
-    load_unknown_thread = threading.Thread(target=load_songs_to_playlist, args=(unknown_songs_playlist['id'], transformed_songs["unknown"], ytmusic, "Unknown"))
+    # try:
+    #     transform_thread = threading.Thread(target=trasform_songs, args=(ytmusic_songs,))
+    #     load_hindi_thread = threading.Thread(target=load_songs_to_playlist, args=(hindi_playlist['id'], transformed_songs["hindi"], ytmusic, "hindi"))
+    #     load_non_hindi_thread = threading.Thread(target=load_songs_to_playlist, args=(non_hindi_playlist['id'], transformed_songs["non_hindi"], ytmusic, "non_hindi"))
+    #     load_unknown_thread = threading.Thread(target=load_songs_to_playlist, args=(unknown_songs_playlist['id'], transformed_songs["unknown"], ytmusic, "unknown"))
 
-    # Start threads
-    transform_thread.start()
-    load_hindi_thread.start()
-    load_non_hindi_thread.start()
-    load_unknown_thread.start()
+    #     # Start threads
+    #     transform_thread.start()
+    #     load_hindi_thread.start()
+    #     load_non_hindi_thread.start()
+    #     load_unknown_thread.start()
 
-    # Wait for all threads to complete
-    transform_thread.join() 
-    load_hindi_thread.join()
-    load_non_hindi_thread.join()
-    load_unknown_thread.join()
-
+    #     # Wait for all threads to complete
+    #     transform_thread.join() 
+    #     load_hindi_thread.join()
+    #     load_non_hindi_thread.join()
+    #     load_unknown_thread.join()
+    # except Exception as e:
+    #     breakpoint()
+    #     print(f"Error occurred: {e}")
+    #     exit(1)
     print("Done!")
 
 
